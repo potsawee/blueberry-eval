@@ -1,0 +1,55 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+ENV/
+
+# Models & Checkpoints
+*.pth
+*.ckpt
+*.pt
+*.h5
+*.pkl
+*.joblib
+checkpoints/
+models/
+runs/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# Logs & Monitoring
+*.log
+logs/
+wandb/
+mlruns/
+
+# Environment
+.env
+.env.local
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Data & Results
+data/
+evaluation_results/
+legacy/
+generated_outputs/
+
+# ASR Librispeech
+asr_librispeech/asr_outputs/
