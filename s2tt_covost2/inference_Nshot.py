@@ -96,6 +96,12 @@ def parse_args() -> argparse.Namespace:
         default=0.8,
         help="Top-p (nucleus) sampling parameter (default: 0.9)"
     )
+    parser.add_argument(
+        "--max_prompt_length",
+        type=int,
+        default=8000,
+        help="Maximum prompt length in tokens. Samples exceeding this will be skipped (default: 8000)"
+    )
     return parser.parse_args()
 
 
@@ -182,10 +188,11 @@ def run_inference(
     max_new_tokens: int,
     temperature: float,
     top_p: float,
-):
-    # print(f"Prompt: '{prompt}'")
+) -> Tuple[str, int]:
     # by default, tokenizer prepends the <|begin_of_text|> token
     inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
+    prompt_length = inputs.input_ids.shape[1]
+    
     with torch.no_grad():
         outputs = model.generate(
             **inputs,
@@ -197,9 +204,8 @@ def run_inference(
             eos_token_id=128257, # 128257 = <|text_end|>
             
         )
-    input_len = inputs.input_ids.shape[1]
-    generated_text = tokenizer.decode(outputs[0, input_len:], skip_special_tokens=True).strip()
-    return generated_text
+    generated_text = tokenizer.decode(outputs[0, prompt_length:], skip_special_tokens=True).strip()
+    return generated_text, prompt_length
 
 def task_s2tt(
     test_sample: dict,
@@ -211,8 +217,14 @@ def task_s2tt(
     max_new_tokens: int,
     temperature: float,
     top_p: float,
-) -> str:
-
+    max_prompt_length: int,
+) -> Tuple[str, int, bool]:
+    """
+    Returns:
+        generated_text: The generated translation
+        prompt_length: Length of the prompt in tokens
+        skipped: Whether the sample was skipped due to length
+    """
     # Create N-shot prompt
     prompt = ""
     for train_sample in train_samples:
@@ -232,11 +244,19 @@ def task_s2tt(
     # get rid of the first <|begin_of_text|> at the beginning of the prompt as the tokenizer will prepend it
     prompt = prompt[len("<|begin_of_text|>"):]
 
+    # Check prompt length before inference
+    inputs = tokenizer(prompt, return_tensors="pt")
+    prompt_length = inputs.input_ids.shape[1]
+    
+    if prompt_length > max_prompt_length:
+        logger.warning(f"Skipping sample - prompt length {prompt_length} exceeds max {max_prompt_length}")
+        return "", prompt_length, True
+
     # Generate transcription
-    generated_text = run_inference(
+    generated_text, _ = run_inference(
         prompt, marin_model, tokenizer, max_new_tokens, temperature, top_p
     )
-    return generated_text
+    return generated_text, prompt_length, False
 
 def main() -> None:
     # Parse arguments
@@ -292,6 +312,11 @@ def main() -> None:
     all_hypotheses = []
     total_bleu = 0.0
     samples_processed = 0
+    samples_skipped = 0
+    
+    # Initialize prompt length tracking
+    total_prompt_length = 0
+    prompt_lengths = []
     
     # Process each sample
     for sample_idx, sample in enumerate(tqdm(test_dataset)):
@@ -306,13 +331,36 @@ def main() -> None:
             )
         
         # Task Speech-to-Text Translation
-        translated_text = task_s2tt(
+        translated_text, prompt_length, skipped = task_s2tt(
             sample, train_samples, mimi_model, marin_model, tokenizer, device,
-            args.max_new_tokens, args.temperature, args.top_p
+            args.max_new_tokens, args.temperature, args.top_p, args.max_prompt_length
         )
+        
+        # Track prompt length
+        prompt_lengths.append(prompt_length)
+        total_prompt_length += prompt_length
+        current_avg_prompt_length = total_prompt_length / (sample_idx + 1)
         
         # Ground truth translation
         ground_truth_translation = sample["translation"]
+        
+        # Handle skipped samples
+        if skipped:
+            samples_skipped += 1
+            result = {
+                "file_id": file_id,
+                "reference": ground_truth_translation,
+                "hypothesis": "",
+                "bleu": 0.0,
+                "details": None,
+                "skipped": True,
+                "prompt_length": prompt_length,
+            }
+            all_results.append(result)
+            print(f"{file_id}: SKIPPED (prompt length: {prompt_length})")
+            print(f"Average Prompt Length: {current_avg_prompt_length:.1f} tokens")
+            sys.stdout.flush()
+            continue
         
         print("REF-translation: ", ground_truth_translation)
         print("HYP-translation: ", translated_text)
@@ -336,12 +384,15 @@ def main() -> None:
             "hypothesis": translated_text,
             "bleu": bleu_score,
             "details": details,
+            "skipped": False,
+            "prompt_length": prompt_length,
         }
         all_results.append(result)
         
         # Log BLEU for this sample and running average
-        print(f"{file_id}: BLEU = {bleu_score:.2f}")
+        print(f"{file_id}: BLEU = {bleu_score:.2f} | Prompt Length: {prompt_length}")
         print(f"Running Average BLEU: {current_avg_bleu:.2f} [{samples_processed}/{len(test_dataset)} samples]")
+        print(f"Average Prompt Length: {current_avg_prompt_length:.1f} tokens | Skipped: {samples_skipped}")
         sys.stdout.flush()
     
     # Compute final statistics
@@ -354,10 +405,17 @@ def main() -> None:
     corpus_bleu_result = corpus_bleu(all_hypotheses, [all_references])
     corpus_bleu_score = corpus_bleu_result.score
     
+    # Compute prompt length statistics
+    avg_prompt_length = np.mean(prompt_lengths) if prompt_lengths else 0.0
+    max_prompt_length_seen = max(prompt_lengths) if prompt_lengths else 0
+    min_prompt_length_seen = min(prompt_lengths) if prompt_lengths else 0
+    median_prompt_length = np.median(prompt_lengths) if prompt_lengths else 0.0
+    
     # Create summary
     summary = {
         "total_samples": len(test_dataset),
         "samples_processed": samples_processed,
+        "samples_skipped": samples_skipped,
         "average_bleu": average_bleu,
         "corpus_bleu": corpus_bleu_score,
         "corpus_bleu_details": {
@@ -366,10 +424,17 @@ def main() -> None:
             "sys_len": corpus_bleu_result.sys_len,
             "ref_len": corpus_bleu_result.ref_len,
         },
+        "prompt_length_stats": {
+            "average": float(avg_prompt_length),
+            "median": float(median_prompt_length),
+            "min": int(min_prompt_length_seen),
+            "max": int(max_prompt_length_seen),
+        },
         "evaluation_config": {
             "num_shots": args.num_shots,
             "same_n_shot": args.same_n_shot,
             "seed": args.seed,
+            "max_prompt_length": args.max_prompt_length,
         },
         "generation_params": {
             "max_new_tokens": args.max_new_tokens,
@@ -413,12 +478,19 @@ def main() -> None:
     print(f"{'=' * 80}")
     print(f"Total samples: {summary['total_samples']}")
     print(f"Samples processed: {summary['samples_processed']}")
+    print(f"Samples skipped: {summary['samples_skipped']}")
     print(f"Average BLEU: {average_bleu:.2f}")
     print(f"Corpus BLEU: {corpus_bleu_score:.2f}")
     print(f"  - Precisions: {corpus_bleu_result.precisions}")
     print(f"  - Brevity Penalty: {corpus_bleu_result.bp:.4f}")
     print(f"  - System Length: {corpus_bleu_result.sys_len}")
     print(f"  - Reference Length: {corpus_bleu_result.ref_len}")
+    print(f"\nPrompt Length Statistics:")
+    print(f"  - Average: {avg_prompt_length:.1f} tokens")
+    print(f"  - Median: {median_prompt_length:.1f} tokens")
+    print(f"  - Min: {min_prompt_length_seen} tokens")
+    print(f"  - Max: {max_prompt_length_seen} tokens")
+    print(f"  - Max allowed: {args.max_prompt_length} tokens")
     print(f"\nResults saved to {output_dir}")
     print(f"  - Complete results: {results_file}")
     print(f"  - Translations: {translations_file}")

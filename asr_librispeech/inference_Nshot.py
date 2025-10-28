@@ -162,10 +162,11 @@ def run_inference(
     max_new_tokens: int,
     temperature: float,
     top_p: float,
-):
-    # print(f"Prompt: '{prompt}'")
+) -> Tuple[str, int]:
     # by default, tokenizer prepends the <|begin_of_text|> token
     inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
+    prompt_length = inputs.input_ids.shape[1]
+    
     with torch.no_grad():
         outputs = model.generate(
             **inputs,
@@ -177,9 +178,8 @@ def run_inference(
             eos_token_id=128257, # 128257 = <|text_end|>
             
         )
-    input_len = inputs.input_ids.shape[1]
-    generated_text = tokenizer.decode(outputs[0, input_len:], skip_special_tokens=True)
-    return generated_text
+    generated_text = tokenizer.decode(outputs[0, prompt_length:], skip_special_tokens=True)
+    return generated_text, prompt_length
 
 def select_n_shot_examples(
     train_dataset: List[dict],
@@ -223,8 +223,12 @@ def task_asr(
     max_new_tokens: int,
     temperature: float,
     top_p: float,
-) -> str:
-
+) -> Tuple[str, int]:
+    """
+    Returns:
+        generated_text: The generated transcription
+        prompt_length: Length of the prompt in tokens
+    """
     # Create N-shot prompt
     prompt = ""
     for train_sample in train_samples:
@@ -244,10 +248,10 @@ def task_asr(
     prompt = prompt[len("<|begin_of_text|>"):]
 
     # Generate transcription
-    generated_text = run_inference(
+    generated_text, prompt_length = run_inference(
         prompt, marin_model, tokenizer, max_new_tokens, temperature, top_p
     )
-    return generated_text
+    return generated_text, prompt_length
 
 def main() -> None:
     # Parse arguments
@@ -306,6 +310,10 @@ def main() -> None:
     total_deletions = 0
     samples_processed = 0
     
+    # Initialize prompt length tracking
+    total_prompt_length = 0
+    prompt_lengths = []
+    
     # Process each sample
     for sample_idx, sample in enumerate(tqdm(test_dataset)):
         file_id = Path(sample["file_path"]).stem
@@ -319,10 +327,15 @@ def main() -> None:
             )
         
         # Task ASR
-        transcribed_text = task_asr(
+        transcribed_text, prompt_length = task_asr(
             sample, train_samples, mimi_model, marin_model, tokenizer, device,
             args.max_new_tokens, args.temperature, args.top_p
         )
+        
+        # Track prompt length
+        prompt_lengths.append(prompt_length)
+        total_prompt_length += prompt_length
+        current_avg_prompt_length = total_prompt_length / (sample_idx + 1)
         
         # Ground truth transcript
         ground_truth_transcript = sample["transcript"]
@@ -351,6 +364,7 @@ def main() -> None:
             "hypothesis": transcribed_text,
             "wer": wer,
             "details": details,
+            "prompt_length": prompt_length,
         }
         all_results.append(result)
         
@@ -361,8 +375,9 @@ def main() -> None:
         del_pct = (details["deletions"] / ref_words * 100) if ref_words > 0 else 0.0
         
         # Log WER for this sample and running average
-        print(f"{file_id}: WER = {wer:.4f} ({wer*100:.2f}%) [%sub={sub_pct:.2f}, %ins={ins_pct:.2f}, %del={del_pct:.2f}]")
+        print(f"{file_id}: WER = {wer:.4f} ({wer*100:.2f}%) [%sub={sub_pct:.2f}, %ins={ins_pct:.2f}, %del={del_pct:.2f}] | Prompt Length: {prompt_length}")
         print(f"Running Overall WER: {current_overall_wer:.4f} ({current_overall_wer*100:.2f}%) [%sub={current_sub_pct:.2f}, %ins={current_ins_pct:.2f}, %del={current_del_pct:.2f}] [{samples_processed}/{len(test_dataset)} samples]")
+        print(f"Average Prompt Length: {current_avg_prompt_length:.1f} tokens")
         sys.stdout.flush()
     
     # Compute final statistics
@@ -382,6 +397,12 @@ def main() -> None:
     else:
         average_wer = 0.0
     
+    # Compute prompt length statistics
+    avg_prompt_length = np.mean(prompt_lengths) if prompt_lengths else 0.0
+    max_prompt_length_seen = max(prompt_lengths) if prompt_lengths else 0
+    min_prompt_length_seen = min(prompt_lengths) if prompt_lengths else 0
+    median_prompt_length = np.median(prompt_lengths) if prompt_lengths else 0.0
+    
     # Create summary
     summary = {
         "total_samples": len(test_dataset),
@@ -396,6 +417,12 @@ def main() -> None:
         "substitution_rate": overall_sub_pct,
         "insertion_rate": overall_ins_pct,
         "deletion_rate": overall_del_pct,
+        "prompt_length_stats": {
+            "average": float(avg_prompt_length),
+            "median": float(median_prompt_length),
+            "min": int(min_prompt_length_seen),
+            "max": int(max_prompt_length_seen),
+        },
         "evaluation_config": {
             "num_shots": args.num_shots,
             "same_n_shot": args.same_n_shot,
@@ -450,6 +477,11 @@ def main() -> None:
     print(f"Average WER: {average_wer:.4f} ({average_wer*100:.2f}%)")
     print(f"Total errors: {total_errors} (sub={total_substitutions}, ins={total_insertions}, del={total_deletions})")
     print(f"Total words: {total_words}")
+    print(f"\nPrompt Length Statistics:")
+    print(f"  - Average: {avg_prompt_length:.1f} tokens")
+    print(f"  - Median: {median_prompt_length:.1f} tokens")
+    print(f"  - Min: {min_prompt_length_seen} tokens")
+    print(f"  - Max: {max_prompt_length_seen} tokens")
     print(f"\nResults saved to {output_dir}")
     print(f"  - Complete results: {results_file}")
     print(f"  - Transcripts: {transcripts_file}")
