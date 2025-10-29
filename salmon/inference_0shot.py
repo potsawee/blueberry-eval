@@ -2,7 +2,10 @@
 This script performs Acoustic consistency and acoustic-semantic alignment inference on the SALMon dataset.
 
 Usage:
-python inference_0shot.py --output_dir ./salmon_outputs/0shot-blueberry-v1-step238k
+python inference_0shot.py --output_dir generated_outputs/blueberry_8cb/ --num_codebook_for_log_probs 8
+python inference_0shot.py --output_dir generated_outputs/blueberry_4cb/ --num_codebook_for_log_probs 4
+python inference_0shot.py --output_dir generated_outputs/blueberry_2cb/ --num_codebook_for_log_probs 2
+python inference_0shot.py --output_dir generated_outputs/blueberry_1cb/ --num_codebook_for_log_probs 1
 
 """
 
@@ -40,6 +43,7 @@ MIMI_MODEL_ID: str = "kyutai/mimi"
 MARIN_MODEL_NAME: str = "WillHeld/blueberry"
 SOURCE_SAMPLE_RATE: int = 16000
 TARGET_SAMPLE_RATE: int = 24000
+NUM_CODEBOOKS: int = 8
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="ASR inference on LibriSpeech dataset")
@@ -48,6 +52,12 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default="generated_outputs",
         help="Directory to save generated outputs (default: generated_outputs)"
+    )
+    parser.add_argument(
+        "--num_codebook_for_log_probs",
+        type=int,
+        default=NUM_CODEBOOKS,
+        help=f"Number of codebooks for log probabilities (default: {NUM_CODEBOOKS})"
     )
     parser.add_argument(
         "--seed",
@@ -71,7 +81,8 @@ def load_salmon_data() -> List[dict]:
 def run_inference(
     prompt: str, 
     model: AutoModelForCausalLM, 
-    tokenizer: AutoTokenizer, 
+    tokenizer: AutoTokenizer,
+    num_codebook_for_log_probs: int = NUM_CODEBOOKS,
 ):
     # print(f"Prompt: '{prompt}'")
     # by default, tokenizer prepends the <|begin_of_text|> token
@@ -80,6 +91,12 @@ def run_inference(
         outputs = model(**inputs)
     log_dist = torch.log_softmax(outputs.logits, dim=-1).squeeze(0)[:-1]
     log_probs = log_dist[torch.arange(log_dist.shape[0]), inputs.input_ids.squeeze(0)[1:]]
+
+    # strip <|audio_start|> and <|audio_end|>
+    log_probs = log_probs[1:-1]
+    assert len(log_probs) % NUM_CODEBOOKS == 0
+    log_probs = log_probs.reshape(NUM_CODEBOOKS, -1)
+    log_probs = log_probs[:num_codebook_for_log_probs, :]
     return log_probs.mean()
 
 def task_salmon(
@@ -87,6 +104,7 @@ def task_salmon(
     mimi_model: MimiModel,
     marin_model: AutoModelForCausalLM,
     tokenizer: AutoTokenizer,
+    num_codebook_for_log_probs: int,
     device: str,
 ) -> str:
     # Load and resample audio
@@ -95,6 +113,10 @@ def task_salmon(
     pos_audio_resampled = resample_audio(positive_audio, orig_sr=pos_sr, target_sr=TARGET_SAMPLE_RATE)
     neg_audio_resampled = resample_audio(negative_audio, orig_sr=neg_sr, target_sr=TARGET_SAMPLE_RATE)
     
+    # Convert to float32 to match model dtype
+    pos_audio_resampled = pos_audio_resampled.astype(np.float32)
+    neg_audio_resampled = neg_audio_resampled.astype(np.float32)
+    
     # Convert to Mimi audio string
     pos_audio_str = audio_to_str(pos_audio_resampled, mimi_model, device)
     neg_audio_str = audio_to_str(neg_audio_resampled, mimi_model, device)
@@ -102,11 +124,11 @@ def task_salmon(
     # Generate transcription
     pos_prompt = f"<|audio_start|>{pos_audio_str}<|audio_end|>"
     pos_logprob = run_inference(
-        pos_prompt, marin_model, tokenizer
+        pos_prompt, marin_model, tokenizer, num_codebook_for_log_probs
     )
     neg_prompt = f"<|audio_start|>{neg_audio_str}<|audio_end|>"
     neg_logprob = run_inference(
-        neg_prompt, marin_model, tokenizer
+        neg_prompt, marin_model, tokenizer, num_codebook_for_log_probs
     )
     return pos_logprob, neg_logprob
 
@@ -152,11 +174,13 @@ def main() -> None:
     task_based_scores = {}
     task_based_samples = {}
 
+    num_codebook_for_log_probs = args.num_codebook_for_log_probs
+
     # Process consistency part first
     for sample in tqdm(salmon_data["train"]):
         # Task SALMon
         pos_logp, neg_logp = task_salmon(
-            sample, mimi_model, marin_model, tokenizer, device
+            sample, mimi_model, marin_model, tokenizer, num_codebook_for_log_probs, device
         )
 
         if sample["task"] not in task_based_scores:
