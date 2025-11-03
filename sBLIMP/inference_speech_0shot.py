@@ -2,10 +2,10 @@
 This script performs Acoustic consistency and acoustic-semantic alignment inference on the sBLIMP dataset.
 
 Usage:
-python inference_0shot.py --output_dir generated_outputs/blueberry_8cb/ --num_codebook_for_log_probs 8
-python inference_0shot.py --output_dir generated_outputs/blueberry_4cb/ --num_codebook_for_log_probs 4
-python inference_0shot.py --output_dir generated_outputs/blueberry_2cb/ --num_codebook_for_log_probs 2
-python inference_0shot.py --output_dir generated_outputs/blueberry_1cb/ --num_codebook_for_log_probs 1
+python inference_speech_0shot.py --output_dir generated_outputs/blueberry_8cb/ --num_codebook_for_log_probs 8
+python inference_speech_0shot.py --output_dir generated_outputs/blueberry_4cb/ --num_codebook_for_log_probs 4
+python inference_speech_0shot.py --output_dir generated_outputs/blueberry_2cb/ --num_codebook_for_log_probs 2
+python inference_speech_0shot.py --output_dir generated_outputs/blueberry_1cb/ --num_codebook_for_log_probs 1
 
 """
 
