@@ -61,6 +61,7 @@ def run_inference_no_postprocessing(
     temperature: float,
     top_p: float,
     end_token_id: int, # 128259 = <|audio_end|>, 128257 = <|text_end|>, 128001 = <|end_of_text|>
+    min_new_tokens: int = 0,
 ):
     """Run inference with the model."""
     inputs = tokenizer(prompt, return_tensors="pt").to(marin_model.device)
@@ -68,6 +69,7 @@ def run_inference_no_postprocessing(
         outputs = marin_model.generate(
             **inputs,
             max_new_tokens=max_new_tokens,
+            min_new_tokens=min_new_tokens,
             do_sample=True,
             temperature=temperature,
             top_p=top_p,
@@ -111,6 +113,7 @@ def generate_zero_shot_tts(
     temperature: float,
     top_p: float,
     max_new_tokens: int,
+    min_new_tokens: int,
     seed: int,
 ):
     """Generate speech using zero-shot TTS."""
@@ -138,7 +141,7 @@ def generate_zero_shot_tts(
     )
     
     output, prompt_length = run_inference_no_postprocessing(
-        prompt, max_new_tokens, temperature, top_p, end_token_id=128259, # <|audio_end|>
+        prompt, max_new_tokens, temperature, top_p, end_token_id=128259, min_new_tokens=min_new_tokens, # <|audio_end|>
     )
 
     generated_audio_str = tokenizer.decode(output[prompt_length:], skip_special_tokens=False)
@@ -162,6 +165,7 @@ def generate_speech_continuation(
     temperature: float,
     top_p: float,
     max_new_tokens: int,
+    min_new_tokens: int,
     seed: int,
 ):
     """Generate speech continuation."""
@@ -187,7 +191,7 @@ def generate_speech_continuation(
         prompt = f"<|audio_start|>{audio_str}<|audio_end|><|text_start|>"
     
     output, _ = run_inference_no_postprocessing(
-        prompt, max_new_tokens, temperature, top_p, end_token_id=128001, # <|end_of_text|>
+        prompt, max_new_tokens, temperature, top_p, end_token_id=128001, min_new_tokens=min_new_tokens, # <|end_of_text|>
     )
     generated_text = tokenizer.decode(output, skip_special_tokens=False)
     
@@ -243,6 +247,7 @@ def generate_transcription(
     temperature: float,
     top_p: float,
     max_new_tokens: int,
+    min_new_tokens: int,
     seed: int,
 ):
     """Generate transcription using ASR."""
@@ -264,7 +269,7 @@ def generate_transcription(
     # Generate transcription
     prompt = f"<|audio_start|>{audio_str}<|audio_end|><|text_start|>"
     output, _ = run_inference_no_postprocessing(
-        prompt, max_new_tokens, temperature, top_p, end_token_id=128257, # <|text_end|>
+        prompt, max_new_tokens, temperature, top_p, end_token_id=128257, min_new_tokens=min_new_tokens, # <|text_end|>
     )
     generated_text = tokenizer.decode(output, skip_special_tokens=False)
 
@@ -336,6 +341,16 @@ def create_demo():
                                 label="Max New Tokens",
                                 info="Maximum length of generated audio"
                             )
+                            tts_min_new_tokens = gr.Slider(
+                                minimum=0,
+                                maximum=1000,
+                                value=0,
+                                step=50,
+                                label="Min New Tokens",
+                                info="Minimum length of generated audio"
+                            )
+                        
+                        with gr.Row():
                             tts_seed = gr.Number(
                                 value=42,
                                 label="Random Seed",
@@ -365,6 +380,7 @@ def create_demo():
                         tts_temperature,
                         tts_top_p,
                         tts_max_new_tokens,
+                        tts_min_new_tokens,
                         tts_seed,
                     ],
                     outputs=[tts_output_audio, tts_status_text],
@@ -414,6 +430,16 @@ def create_demo():
                                 step=100,
                                 label="Max New Tokens"
                             )
+                            cont_min_new_tokens = gr.Slider(
+                                minimum=0,
+                                maximum=1000,
+                                value=100,
+                                step=50,
+                                label="Min New Tokens",
+                                info="Minimum length for speech continuation"
+                            )
+                        
+                        with gr.Row():
                             cont_seed = gr.Number(
                                 value=42,
                                 label="Random Seed",
@@ -443,6 +469,7 @@ def create_demo():
                         cont_temperature,
                         cont_top_p,
                         cont_max_new_tokens,
+                        cont_min_new_tokens,
                         cont_seed,
                     ],
                     outputs=[cont_output_audio, cont_status_text],
@@ -486,6 +513,16 @@ def create_demo():
                                 step=100,
                                 label="Max New Tokens"
                             )
+                            asr_min_new_tokens = gr.Slider(
+                                minimum=0,
+                                maximum=1000,
+                                value=0,
+                                step=50,
+                                label="Min New Tokens",
+                                info="Minimum length of transcription"
+                            )
+                        
+                        with gr.Row():
                             asr_seed = gr.Number(
                                 value=42,
                                 label="Random Seed",
@@ -513,6 +550,7 @@ def create_demo():
                         asr_temperature,
                         asr_top_p,
                         asr_max_new_tokens,
+                        asr_min_new_tokens,
                         asr_seed,
                     ],
                     outputs=[asr_output_text, asr_status_text],
