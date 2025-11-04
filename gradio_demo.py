@@ -13,6 +13,7 @@ import librosa
 import numpy as np
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, MimiModel
+from transformers.generation import LogitsProcessor
 
 # Add parent directory to path to import utils
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -29,6 +30,17 @@ mimi_model = None
 marin_model = None
 tokenizer = None
 device = None
+
+
+class SuppressTokensLogitsProcessor(LogitsProcessor):
+    """Logits processor that suppresses specific tokens by setting their logits to -inf."""
+    
+    def __init__(self, suppress_tokens: list):
+        self.suppress_tokens = suppress_tokens
+    
+    def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor) -> torch.FloatTensor:
+        scores[:, self.suppress_tokens] = -float('inf')
+        return scores
 
 
 def load_models():
@@ -62,9 +74,16 @@ def run_inference_no_postprocessing(
     top_p: float,
     end_token_id: int, # 128259 = <|audio_end|>, 128257 = <|text_end|>, 128001 = <|end_of_text|>
     min_new_tokens: int = 0,
+    suppress_tokens: list = None,
 ):
     """Run inference with the model."""
     inputs = tokenizer(prompt, return_tensors="pt").to(marin_model.device)
+    
+    # Set up logits processor if needed
+    logits_processor = None
+    if suppress_tokens:
+        logits_processor = [SuppressTokensLogitsProcessor(suppress_tokens)]
+    
     with torch.no_grad():
         outputs = marin_model.generate(
             **inputs,
@@ -75,6 +94,7 @@ def run_inference_no_postprocessing(
             top_p=top_p,
             pad_token_id=tokenizer.eos_token_id,
             eos_token_id=end_token_id,
+            logits_processor=logits_processor,
         )
     return outputs[0], inputs.input_ids.shape[1]
 
@@ -167,6 +187,7 @@ def generate_speech_continuation(
     max_new_tokens: int,
     min_new_tokens: int,
     seed: int,
+    suppress_tokens_str: str,
 ):
     """Generate speech continuation."""
     if not audio_path:
@@ -176,6 +197,11 @@ def generate_speech_continuation(
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
     np.random.seed(seed)
+    
+    # Parse suppress tokens
+    suppress_tokens = None
+    if suppress_tokens_str and suppress_tokens_str.strip():
+        suppress_tokens = [int(t.strip()) for t in suppress_tokens_str.split(",") if t.strip()]
     
     # Load and resample the audio
     audio, sr = librosa.load(audio_path, sr=None)
@@ -191,7 +217,7 @@ def generate_speech_continuation(
         prompt = f"<|audio_start|>{audio_str}<|audio_end|><|text_start|>"
     
     output, _ = run_inference_no_postprocessing(
-        prompt, max_new_tokens, temperature, top_p, end_token_id=128001, min_new_tokens=min_new_tokens, # <|end_of_text|>
+        prompt, max_new_tokens, temperature, top_p, end_token_id=128001, min_new_tokens=min_new_tokens, suppress_tokens=suppress_tokens, # <|end_of_text|>
     )
     generated_text = tokenizer.decode(output, skip_special_tokens=False)
     
@@ -281,6 +307,43 @@ def generate_transcription(
         return "", "No transcription generated."
     
     return transcribed_text, "Transcription successful!"
+
+
+def generate_text(
+    prompt_text: str,
+    temperature: float,
+    top_p: float,
+    max_new_tokens: int,
+    min_new_tokens: int,
+    seed: int,
+    suppress_tokens_str: str,
+):
+    """Generate text continuation."""
+    if not prompt_text:
+        return "", "Please provide input text."
+    
+    # Set seed
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    np.random.seed(seed)
+    
+    # Parse suppress tokens
+    suppress_tokens = None
+    if suppress_tokens_str and suppress_tokens_str.strip():
+        suppress_tokens = [int(t.strip()) for t in suppress_tokens_str.split(",") if t.strip()]
+    
+    # Generate text
+    prompt = f"<|text_start|>{prompt_text}"
+    output, prompt_length = run_inference_no_postprocessing(
+        prompt, max_new_tokens, temperature, top_p, end_token_id=128001, min_new_tokens=min_new_tokens, suppress_tokens=suppress_tokens, # <|end_of_text|>
+    )
+    
+    generated_text = tokenizer.decode(output[prompt_length:], skip_special_tokens=False)
+    
+    if not generated_text:
+        return "", "No text generated."
+    
+    return generated_text, "Generation successful!"
 
 
 def create_demo():
@@ -446,6 +509,13 @@ def create_demo():
                                 precision=0
                             )
                         
+                        cont_suppress_tokens = gr.Textbox(
+                            label="Suppress Tokens (comma-separated token IDs)",
+                            placeholder="e.g., 128258, 128259",
+                            value="",
+                            info="Optional: Enter token IDs to prevent from being generated"
+                        )
+                        
                         cont_generate_btn = gr.Button("▶️ Continue Speech", variant="primary", size="lg")
                     
                     with gr.Column():
@@ -471,6 +541,7 @@ def create_demo():
                         cont_max_new_tokens,
                         cont_min_new_tokens,
                         cont_seed,
+                        cont_suppress_tokens,
                     ],
                     outputs=[cont_output_audio, cont_status_text],
                 )
@@ -554,6 +625,95 @@ def create_demo():
                         asr_seed,
                     ],
                     outputs=[asr_output_text, asr_status_text],
+                )
+            
+            # Tab 4: Text Generation
+            with gr.Tab("Text Generation"):
+                gr.Markdown("### Generate text continuation from a prompt!")
+                
+                with gr.Row():
+                    with gr.Column():
+                        gr.Markdown("#### Input")
+                        text_input = gr.Textbox(
+                            label="Input Text",
+                            placeholder="Enter your text prompt here...",
+                            lines=5,
+                        )
+                        
+                        gr.Markdown("#### Generation Parameters")
+                        with gr.Row():
+                            text_temperature = gr.Slider(
+                                minimum=0.1,
+                                maximum=2.0,
+                                value=1.0,
+                                step=0.1,
+                                label="Temperature"
+                            )
+                            text_top_p = gr.Slider(
+                                minimum=0.1,
+                                maximum=1.0,
+                                value=0.9,
+                                step=0.05,
+                                label="Top-p"
+                            )
+                        
+                        with gr.Row():
+                            text_max_new_tokens = gr.Slider(
+                                minimum=10,
+                                maximum=2000,
+                                value=200,
+                                step=10,
+                                label="Max New Tokens"
+                            )
+                            text_min_new_tokens = gr.Slider(
+                                minimum=0,
+                                maximum=500,
+                                value=0,
+                                step=10,
+                                label="Min New Tokens"
+                            )
+                        
+                        with gr.Row():
+                            text_seed = gr.Number(
+                                value=42,
+                                label="Random Seed",
+                                precision=0
+                            )
+                        
+                        text_suppress_tokens = gr.Textbox(
+                            label="Suppress Tokens (comma-separated token IDs)",
+                            placeholder="e.g., 128258, 128259",
+                            value="",
+                            info="Optional: Enter token IDs to prevent from being generated"
+                        )
+                        
+                        text_generate_btn = gr.Button("✍️ Generate Text", variant="primary", size="lg")
+                    
+                    with gr.Column():
+                        gr.Markdown("#### Output")
+                        text_output = gr.Textbox(
+                            label="Generated Text",
+                            lines=10,
+                            interactive=False,
+                            show_copy_button=True,
+                        )
+                        text_status = gr.Textbox(
+                            label="Status",
+                            interactive=False,
+                        )
+                
+                text_generate_btn.click(
+                    fn=generate_text,
+                    inputs=[
+                        text_input,
+                        text_temperature,
+                        text_top_p,
+                        text_max_new_tokens,
+                        text_min_new_tokens,
+                        text_seed,
+                        text_suppress_tokens,
+                    ],
+                    outputs=[text_output, text_status],
                 )
     
     return demo
